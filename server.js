@@ -1,14 +1,23 @@
 const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
-const { ChatOpenAI } = require('@langchain/openai');
-const { ChatPromptTemplate, MessagesPlaceholder } = require('@langchain/core/prompts');
-const { AIMessage, HumanMessage } = require('@langchain/core/messages');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ==================== TRATAMENTO SEGURO DA CHAVE DA API ====================
+// Lê do .env de forma segura e remove espaços ou aspas que possam quebrar a requisição
+const rawKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
+const apiKey = rawKey ? rawKey.trim().replace(/^["']|["']$/g, "") : "";
+
+if (!apiKey) {
+  console.error("\n❌ [ERRO CRÍTICO] Nenhuma chave de API foi encontrada no seu arquivo .env!");
+} else {
+  console.log(`\n✅ [OK] Chave de API detectada com sucesso! Começa com: ${apiKey.substring(0, 6)}...\n`);
+}
+// ===========================================================================
 
 // 1. Inicialização do Banco de Dados SQLite (Local)
 const db = new sqlite3.Database('./database.sqlite', (err) => {
@@ -75,29 +84,30 @@ app.put('/api/tutores/:id', (req, res) => {
   const sql = `UPDATE tutores SET status = ?, instrucoes = ?, fonte_url = ? WHERE id = ?`;
   db.run(sql, [status, instrucoes, fonte_url, req.params.id], function(err) {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: 'Tutor atualizado com sucesso!' });
+    res.json({ message: 'Tutor updated successfully!' });
   });
 });
 
 // ==================== ENGINE DO AGENTE DE CHAT ====================
 
-// Função auxiliar para o Agente simular busca de conhecimento sem banco vetorial (RAG via Agent Tools)
+// Função auxiliar para buscar conhecimento externo de URLs
 async function buscarConhecimentoExterno(url) {
   if (!url) return "";
   try {
     const response = await fetch(url);
     if (!response.ok) return "";
     const text = await response.text();
-    return text.substring(0, 3000); // Limita o tamanho do texto para não estourar o contexto da LLM
+    return text.substring(0, 3000); // Limita o tamanho para evitar estourar o contexto
   } catch (error) {
     console.error("Erro ao buscar fonte de conhecimento:", error);
     return "";
   }
 }
 
-// Rota de Conversação do Widget (Iframe)
+// Rota de Conversação do Widget (Iframe) utilizando chamada direta à API do Gemini
 app.post('/api/chat', async (req, res) => {
   const { tutorId, sessionId, message } = req.body;
+  console.log(`[LOG - CHAT] Nova mensagem recebida. Sessão: ${sessionId} | Tutor: ${tutorId}`);
 
   if (!tutorId || !message) {
     return res.status(400).json({ error: "Faltando parâmetros obrigatórios." });
@@ -108,53 +118,85 @@ app.post('/api/chat', async (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
     if (!tutor) return res.status(404).json({ error: 'Tutor inativo ou não encontrado.' });
 
-    // 2. Buscar histórico recente da sessão para manter o contexto
+    // 2. Buscar histórico recente para manter a memória da conversa (últimas 10 mensagens)
     db.all(`SELECT role, content FROM historico WHERE session_id = ? AND tutor_id = ? ORDER BY timestamp DESC LIMIT 10`, 
     [sessionId, tutorId], async (err, historyRows) => {
       if (err) return res.status(500).json({ error: err.message });
 
-      // Inverter a ordem para ficar cronológica
+      // Inverter a ordem das linhas para que fiquem em ordem cronológica (antigas primeiro)
       const history = historyRows.reverse().map(row => {
-        return row.role === 'user' ? new HumanMessage(row.content) : new AIMessage(row.content);
+        return {
+          role: row.role === 'user' ? 'user' : 'model',
+          parts: [{ text: row.content }]
+        };
       });
 
-      // 3. Estratégia Agêntica: Buscar o conteúdo da fonte HTTP se existir
+      // 3. Buscar o conteúdo da fonte HTTP se existir
       let contextoAdicional = "";
       if (tutor.fonte_url) {
         contextoAdicional = await buscarConhecimentoExterno(tutor.fonte_url);
       }
 
-      // 4. Configurar a LLM e o Prompt Template via LangChain
-      const model = new ChatOpenAI({
-        model: 'gpt-3.5-turbo', // Ou 'gpt-4o-mini'
-        temperature: 0.3,
+      // 4. Injetar as instruções de persona e RAG diretamente na estrutura de mensagens
+      const systemInstructionText = `INSTRUÇÕES DE PERSONA (Siga estritamente):
+Você é um Tutor Inteligente com as seguintes diretrizes:
+${tutor.instrucoes}
+
+${contextoAdicional ? `Use as seguintes informações coletadas da sua base de dados/fonte para enriquecer sua resposta:\n${contextoAdicional}` : ''}
+
+Responda de forma direta e amigável, alinhada à sua persona.
+---`;
+
+      // Preparamos o payload injetando a instrução inicial para o modelo aceitar o contexto de forma universal
+      const contents = [];
+      
+      contents.push({
+        role: 'user',
+        parts: [{ text: `${systemInstructionText}\n\nEntendido. Responda apenas "Entendi as instruções e estou pronto para conversar."` }]
+      });
+      contents.push({
+        role: 'model',
+        parts: [{ text: "Entendi as instruções e estou pronto para conversar." }]
       });
 
-      const promptSystem = `
-        Você é um Tutor Inteligente com as seguintes diretrizes:
-        ${tutor.instrucoes}
+      // Adiciona o histórico de conversas anterior
+      contents.push(...history);
 
-        ${contextoAdicional ? `Use as seguintes informações coletadas da sua base de dados/fonte para enriquecer sua resposta:\n${contextoAdicional}` : ''}
-        
-        Responda de forma direta e amigável, alinhada à sua persona.
-      `;
-
-      const chatPrompt = ChatPromptTemplate.fromMessages([
-        ["system", promptSystem],
-        new MessagesPlaceholder("history"),
-        ["human", "{input}"]
-      ]);
+      // Adiciona a nova mensagem enviada pelo usuário
+      contents.push({
+        role: 'user',
+        parts: [{ text: message }]
+      });
 
       try {
-        const chain = chatPrompt.pipe(model);
-        const response = await chain.invoke({
-          history: history,
-          input: message
-        });
+        if (!apiKey) {
+          throw new Error("Chave de API do Gemini não configurada.");
+        }
 
-        const reply = response.content;
+        // 5. Chamada direta de API usando a rota v1beta com a chave segura
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: contents,
+              generationConfig: {
+                temperature: 0.3
+              }
+            })
+          }
+        );
 
-        // 5. Salvar a nova interação no histórico do banco SQLite
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error?.message || "Erro na API do Gemini");
+        }
+
+        const reply = data.candidates[0].content.parts[0].text;
+
+        // 6. Salvar as novas interações no histórico do banco SQLite
         db.serialize(() => {
           db.run(`INSERT INTO historico (session_id, tutor_id, role, content) VALUES (?, ?, 'user', ?)`, [sessionId, tutorId, message]);
           db.run(`INSERT INTO historico (session_id, tutor_id, role, content) VALUES (?, ?, 'assistant', ?)`, [sessionId, tutorId, reply]);
@@ -163,7 +205,7 @@ app.post('/api/chat', async (req, res) => {
         res.json({ reply });
 
       } catch (llmError) {
-        console.error("Erro na chamada da LLM:", llmError);
+        console.error("Erro ao chamar o Gemini diretamente:", llmError.message);
         res.status(500).json({ error: "Erro interno no processamento do Tutor." });
       }
     });
